@@ -1,13 +1,13 @@
-PAPI: Exploiting Dynamic Parallelism in Large Language Model Decoding with a Processing-In-Memory-Enabled Computing System
+# PAPI: Exploiting Dynamic Parallelism in Large Language Model Decoding with a Processing-In-Memory-Enabled Computing System
 PArallel Decoding with PIM
 
-# “我的总结”
+## “我的总结”
 提出一种结合 GPU 与 PIM 的异构系统架构，用于加速 大语言模型（LLM）的解码阶段（decoding）。论文指出在实际推理服务中，请求级并行度（RLP）和 token级并行度（TLP）会动态变化，从而导致全连接层（FC）在 memory-bound 和 compute-bound 之间切换，而现有系统采用静态算子分配策略无法适应这种变化。为此，PAPI 设计了专门的 FC-PIM （专门加速 memory-bound 的全连接层计算）和 Attn-PIM 单元（用于执行 attention 计算和KV cache访问），并提出基于运行时并行度（RLP×TLP）的动态调度方法，在 GPU 和 PIM 之间自适应分配 FC 计算。
 未来工作：
 （1）更智能的调度算法，使用一个简单规则RLP×TLP>α 来决定 FC 层放在 GPU 还是 PIM。可以使用一些reinforcement learning方法来改善调度算法
 （2）PAPI 主要优化计算位置，而没有深入优化通信。可以考虑改进 GPU-PIM 互联结构，减少通信开销
 
-# Abstract
+## Abstract
 LLM 依赖 LLM decoding (time-consuming) to generate output tokens
 
 前人的工作： 提高 LLM decoding by parallelism techniques (e.g. batching decoding, speculative decoding), decoding算法包括：
@@ -25,8 +25,8 @@ e.g. statically identify并映射这些不同的内核到由processing-in-memory
 我们在三种广泛使用的 LLM（即 LLaMA-65B、GPT-3 66B 和 GPT-3 175B）上的实验结果表明，PAPI 的性能提升了 1.8x, 11.1×
 与最先进的异构 LLM 加速器（即 GPU 和 PIM）和最先进的仅 PIM LLM 加速器相比，速度分别提高了 100%。
 
-# 介绍
-## 已有的
+## 介绍
+### 已有的
 LLM推理包括两个阶段：预填充prefill和decoding。
 - Prefill: 处理请求中的all input tokens，为解码阶段创建hidden states并生成第一个输出标记。
 - 在常规解码阶段，模型在每次解码迭代中生成一个输出标记。占据了大部分执行 时间 [11,12]。 
@@ -38,7 +38,7 @@ LLM推理包括两个阶段：预填充prefill和decoding。
 最近的研究探索了：同时使用 PIM 单元和以计算为中心的加速器（例如 GPU）的异构架构[22,23,24,25,26] to accelerate the LLM inference process by 将计算密集型和内存密集型内核映射到以计算为中心和以内存为中心加速器。
 这些工作 statically characterize LLM decoding kernels，并基于静态识别的特征，将不同类型的内核调度到不同的计算单元
 
-## 观察 -> 改变
+### 观察 -> 改变
 我们观察到，一些内核会根据 variations in decoding parallelism 动态地从计算密集型转变为内存密集型（或者反过来），因为解码并行度在运行时会动态变化。动态变化的原因：
 - 计算系统中的最大解码并行度受限于请求的内存需求（取决于请求的输出长度），并且无法在执行前预测
 - 最大解码并行度还会受到不同用户需求的影响，例如服务质量（QoS）。
@@ -50,6 +50,7 @@ LLM推理包括两个阶段：预填充prefill和decoding。
 - 设计了一种包含 PIM 单元、GPU 和主机 CPU 的异构架构，以满足不同内核不同的计算和内存需求。
 - 设计了一种混合 PIM 架构，包含两种不同类型的 PIM 单元，即性能优化型 PIM 单元和内存容量优化型 PIM 单元，分别满足具有不同计算需求和内存占用的内存密集型内核的需求。
 
+### 结果/结论
 比较与 
 (1) 由 AttAcc 组成的最先进的异构 LLM 加速器进行 [23] + 6 个 NVIDIA A100 GPU [29] (A100+AttAcc), 
 (2) 一种由三星 HBM-PIM 组成的异构架构 [30] + NVIDIA A100 GPU（A100+HBM-PIM）
@@ -758,3 +759,10 @@ FC-PIM 特别适合利用 MoE 架构固有的稀疏性。在 MoE 模型中，不
 [101] 郭从、唐家明、胡伟明、冷静文、张晨、杨范、刘云欣、郭敏仪和朱宇豪。Olive：通过对硬件友好的异常值-受害者对量化来加速大型语言模型。在ISCA 2023 年。
 [102] 卢立强、金一成、毕航瑞、罗子章、李鹏、王涛、梁云。Sanger：一种利用可重构架构实现稀疏注意力机制的协同设计框架。在MICRO 2021 年。
 [103] 王瀚瑞、张哲凯、韩松。Spatten：具有级联标记和头部剪枝的高效稀疏注意力架构。在HPCA中，2021 年。
+
+# LIA
+
+LIA 提出一种面向单 GPU 大模型推理的加速框架：利用 AMX 加速的 CPU 与 GPU 协同计算，把每个 decoder layer 拆成 6 个子层，并用向量策略决定哪些子层在 CPU、哪些在 GPU 执行，通过对每个子层的 load/compute/store 代价建模来自动选出在给定 batch/序列长度下的最优划分，从而在显存不足时减少 PCIe 数据搬运并提升吞吐/降低延迟；同时在吞吐优先的大 batch 场景引入 CXL 内存扩容，采用“参数放 CXL、KV cache 留 DDR”避免 KV 相关子层被 CXL 带宽/延迟拖慢
+未来工作：
+（1）扩展 LIA 的协同计算框架到 多 GPU （多 GPU 后，不只是 CPU-GPU 传输，GPU-GPU 之间的通信也会变瓶颈）
+（2） 从“跑前选一次策略”变成“运行时根据实时负载自动换策略”
