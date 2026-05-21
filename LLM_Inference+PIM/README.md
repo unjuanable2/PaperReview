@@ -173,23 +173,26 @@ controller, to the processing core.
 ### 7.1.Evaluation Methodology
 - Comparison Points and Simulation Methodology
   - 对比系统
-    - A100+AttAcc：
+    - A100+AttAcc-PIM：
       - 6 个 A100 GPU
-        - Each GPU contains 5 HBM devices connected via NVLink，6 个 GPU ↔ 30 个 HBM devices，总约 80GB
+        - Each GPU contains 5 HBM devices connected via NVLink，总约 80GB
+        - 6 个 GPU ↔ 30 个 HBM devices, 总约 6*80=480GB
       - AttAcc PIM (1 FPUnit per DRAM bank)，FC 全在 GPU 上，attention 在 PIM 上
         - 其他 HBM devices，包括 Attn-PIM，容量都是 16 GB      
       - 所有系统都配 90 个 HBM devices，其中 30 个给 FC kernels 的 weight parameters，60 个给 attention kernels
         - 外部公平条件统一：HBM3, 频率 = 333MHz, pin 带宽 = 5.2Gbps/pin, device 数量
     - A100+HBM-PIM：
-      - 6 个 A100 GPU
+      - 6 个 A100 GPU, 总约 6*80=480GB
       - 三星 HBM-PIM: 1 FPUnit per 2 DRAM banks
     - AttAcc-only：纯 PIM，FC 和 attention 都在 PIM 上执行。
     - PAPI：
       - 6 个 A100 GPU
-        - 每 GPU 只算 60GB
+        - 每 GPU 只算 60GB, 总共 6*60 = 360GB
         - 要容纳 GPT-3 175B 的模型参数需要大约 350 GB memory
       - FC-PIM: 4P1B; 更偏算力，容量缩小到 12GB
+        - 30*12=360GB
       - Attn-PIM: 1P2B; 更偏容量，保持 16GB
+        - 60*16=960GB
 - Workloads: 评估 LLaMA-65B、GPT-3 66B、GPT-3 175B，数据类型 FP16，数据集用 creative-writing 和 general-qa tasks in the Dolly dataset，
   - 采用 static batching with varying initial RLP (batch size). $\Rightarrow$ 让系统在真实输入/输出长度变化下，经历动态并行度变化。
 
@@ -270,86 +273,77 @@ A CXL-Enabled GPU-Free System for Large Language Model Inference
 - CENT 的 key ideas：
   - 每个 CXL device 里有 16 个 GDDR6-PIM chips，每个 chip 有 2 个 GDDR6-PIM channels，并配有 PNM units；
     - intra-device communication between PIM chips and PNM units is supported through a shared buffer
+    - memory controller (e.g. CPU/GPU/accelerator) 通过 channel (仓库到处理器之间的公路) 向 memory chip (仓库) 发命令，然后 memory 通过这个 channel 返回数据
+    - 普通 GDDR6 channel = 高速显存通道
+      GDDR6-PIM channel = 高速显存通道 + memory-side compute
   - 多个 CXL devices 通过 CXL switch 连接，由 host CPU 驱动；
     - inter-device communication is enabled by CXL transactions
+  - 支持 LLM 并行映射：
+    - Pipeline Parallel/PP: 每个 transformer block / pipeline stage 放到 device 内多个 memory channels，提升 throughput；
+    - Tensor Parallel/TP: 一个 transformer block 分到多个 CXL devices，降低 latency；
+    - Hybrid TP-PP: 在 throughput 和 latency 之间折中。
   - PIM 做 GEMV/MAC 这类占绝大多数计算量的操作，PNM 做 Softmax、sqrt、division 等复杂操作。
-- (第六段) 作者还强调 CENT 不是只做单 device，而是支持 LLM 并行映射：
-  - Pipeline Parallel/PP: 每个 transformer block / pipeline stage 放到 device 内多个 memory channels，提升 throughput；
-  - TP: 一个 transformer block 分到多个 CXL devices，降低 latency；
-  - Hybrid TP-PP: 在 throughput 和 latency 之间折中。
 
 ## 2.Motivation
-### High Memory Capacity Requirement
-- LLM 参数从 billion 到 trillion 级别增长；context window 也从几千扩到 128K/1M。
-- KV cache 是 per-user 的，不能像 weight 那样在 batch 内共享；context 越长，单个请求占用 memory 越大，系统能容纳的 batch size 越小。
-- Figure 1 的核心意思：Llama2-70B 在 4×A100 80GB 上，batch size 变大时 throughput 会先提高，但一旦 memory requirement 超过 GPU capacity 就饱和；context 从 4K 增到 32K 后，可支持 batch size 从 128 降到 8。
-
-### Low Operational Intensity
-- LLM inference 有两个阶段：
-  - prefill: prompt tokens 可以并行处理，主要是 GEMM，operational intensity 高；
-  - decoding: output tokens 依次生成，主要是 GEMV，operational intensity 低。
-- batching 可以把多个 GEMV 合成 GEMM，提高 operational intensity；但 attention 依赖每个 prompt 自己的 KV cache，所以提升不是线性的。
-- Grouped-query attention 也能把部分 GEMV 变成 narrow GEMM，但仍低于 GPU 充分利用所需的 operational intensity。
-- Figure 2(b): Llama2-70B 只有约 21% GPU compute utilization，而 BERT/ResNet 这类 GEMM-heavy 模型能更好利用 GPU。
-- $\Rightarrow$ GPU 的问题不是跑不了 LLM，而是用昂贵 compute hardware 跑 memory-bound decoding 不划算。
-
-### PIM Provides Higher Memory Bandwidth
-- PIM 可以利用 DRAM internal bandwidth；这个 bandwidth 远高于 GPU 通过外部 HBM interface 能看到的 bandwidth。
-- e.g. GDDR6-based AiM 有 16 TB/s internal bandwidth，而 A100 外部 HBM bandwidth 约 2 TB/s。
-- 因为 LLM decoding low operational intensity，所以 PIM 这种 high bandwidth / lower compute 的设计更贴合 decoding。
-
-### Low Memory Density of PIM
-- PIM 的缺点是 near-bank PU 占用 DRAM die area，导致 memory density 下降。
-- e.g. UPMEM DDR4 R-DIMM 容量降到普通 DIMM 的 25%~50%，AiM GDDR6 channel 降到 75%。
-- 对 LLM 来说，这很麻烦：LLM 本来就需要大量 memory capacity，如果 PIM 容量太低，就必须靠更多 device 和 scalable interconnect 才能部署。
-
-### Scalable Network of PIM
-- 为了把 PIM 扩到 LLM 所需容量，系统需要：
-  - scalable interconnect；
-  - efficient collective communication primitives；
-  - 适合 LLM 的 parallelization mapping。
-- 作者选择 CXL 3.0：
-  - 基于 PCIe physical layer，成本/生态更现实；
-  - 支持通过 CXL switch 做 device-to-device communication；
-  - CXL.mem latency 比 network-based RDMA 低很多；
-  - 可扩展到 4096 nodes，比 NVLink 更 scalable。
-- 虽然 NVLink 带宽更高，但作者认为 LLM inference 的跨 device 数据量较小，CXL bandwidth 不是主要瓶颈。
-
-### Hierarchical PIM-PNM Architecture
-- Transformer block 不只有 GEMV，还包括 RMSNorm、RoPE、SiLU、Softmax 等操作。
-- 如果所有操作都用 general-purpose near-bank PU 做：
-  - near-bank PU 面积开销大，memory density 更低；
-  - general-purpose PU 对少量复杂操作来说 over-provisioned。
-- 作者选择第二种路线：
-  - PIM near-bank PU 做 MAC/GEMV，因为 MAC 占 transformer block 超过 99% arithmetic operations；
-  - PNM units 做 Softmax、sqrt、division、复杂/模型相关操作。
+- **High Memory Capacity Requirement**
+  - LLM 参数从 billion 到 trillion 级别增长；
+  - context window 也从几千扩到 128K/1M。
+  - KV cache 是 per-user 的 (不能像 weight 那样在 batch 内共享), 单个请求 context 越长，系统能容纳的 batch size 越小
+- **Low Operational Intensity**：
+  - LLM inference 有两个阶段：
+    - prefill: 并行处理 tokens within a prompt，主要是 GEMM，operational intensity 高；
+    - decoding: output tokens 依次生成，主要是 GEMV，operational intensity 低。
+      - batching 可以把多个 GEMV 合成 GEMM，提高 operational intensity。但 attention 依赖每个 prompt 自己的 KV cache，所以提升不是线性的。
+      - Grouped-query attention([3]) 把部分 GEMV 变成 narrow GEMM，但仍低于 GPU 充分利用所需的 operational intensity。
+- **GPU Performance Characterization**：vLLM推理框架, 运行 Llama2-70B 模型，在 4×A100 80GB 上
+  - Figure1: batch size 变大时 throughput 会先提高，但一旦 memory requirement 超过 GPU capacity 就饱和；context 从 4K 增到 32K 后，可支持 batch size 从 128 降到 8。
+  - Figure2(a): inference query latency increases with larger batch sizes and longer contexts
+  - Figure2(b): Llama2-70B 只有约 21% GPU compute utilization，而 (encoder-only transformer model) BERT/ (Convolutional Neural Network) ResNet 这类 GEMM-heavy 模型能更好利用 GPU。
+    - decoding an output token in the decoding stage takes 3.4× longer than encoding a prompt token in the prefill stage, 因为 the significant lower operational intensity of GEMV operations
+    $\Rightarrow$ GPU 的问题不是跑不了 LLM，而是用昂贵 compute hardware 跑 memory-bound decoding 不划算。
+- **PIM Provides Higher Memory Bandwidth**
+  - PIM 可以利用 DRAM internal bandwidth，which 远高于 GPU 通过外部 HBM interface 能看到的 bandwidth。
+  - 因为 LLM decoding low operational intensity，所以 PIM 这种 high bandwidth / lower compute 的设计更贴合 decoding。
+- **Low Memory Density of PIM**
+  - PIM 的缺点是 near-bank PU 占用 DRAM die area，导致 memory density 下降。 
+  - LLM 本来就需要大量 memory capacity，如果 PIM 容量太低，就必须靠更多 device 和 scalable interconnect 才能部署。
+- $\Rightarrow$ **Scalable Network of PIM** 为了把 PIM 扩到 LLM 所需容量，系统需要：scalable interconnect, efficient collective communication primitives, 适合 LLM 的 parallelization mapping。
+  - 作者选择 CXL 3.0：
+    - 基于 PCIe physical layer，成本/生态更现实；
+    - 通过 CXL switch 做 device-to-device communication；
+    - CXL.mem latency 比 network-based RDMA 低很多；
+    - 可扩展到 4096 nodes，比 NVLink 更 scalable。
+    - 虽然 NVLink 带宽更高，但作者认为 LLM inference 的跨 device 数据量较小，CXL bandwidth 不是主要瓶颈。
+  - For PP, we provide peer-to-peer *send* and *receive* primitives for the transmission of the embedding vector between the pipeline stages across CXL devices. 
+  - For TP, we implement *gather* and *broadcast* collective communication primitives to transfer partial results. 
+  - To balance the throughput and latency of the network, we study the hybrid TP-PP parallelization strategy using the *multicast* primitive.
+- **Hierarchical PIM-PNM Architecture**
+  - Transformer block 不只有 GEMV，还包括 RMSNorm、RoPE、SiLU、Softmax 等操作。
+  - 如果所有操作都用 general-purpose near-bank PU 做：
+    - near-bank PU 面积开销大，memory density 更低；
+    - MAC 占 transformer block 超过 99% arithmetic operations, general-purpose PU 对少量复杂操作来说 over-provisioned。
+  - 作者选择第二种路线：
+    - PIM near-bank domain-specific PU 做 MAC/GEMV
+    - PNM units 做 Softmax、sqrt、division、复杂/模型相关操作。
 
 ## 3.Background
-- Decoder-only LLM 先 prefill，再 decoding。
-  - prefill: 并行处理 prompt tokens，填 KV cache；
-  - decoding: 每轮基于 previous token 和 KV cache 生成下一个 token。
 - 每个 decoder block 由 self-attention 和 FFN 组成，并配 residual connection 和 normalization。
-- 以 Llama2 为例：
-  - Q/K/V 由 input vector 乘对应 weight matrix 得到；
-  - Q/K 经过 RoPE 编码位置信息；
-  - K/V append 到 KV cache；
-  - Q 与 K cache 得到 score，Softmax 后再乘 V cache；
-  - attention output 经过 output projection、residual、RMSNorm；
-  - FFN 里有两路 FC + SiLU + 最后一层 FC。
+- 以 Llama2 为例 ...
 
 ## 4.CENT Architecture
 ### 4.1.CXL-based Network Architecture
 - CENT 系统结构：
   - host CPU；
-  - CXL switch；
-  - 32 个 CXL devices；
+  - CXL switch, 到 host 用 x16 lanes
+  - 32 个 CXL devices, 每个 CXL device 通过 x4 lanes 接 switch.
   - 每个 CXL device 有 CXL controller、PNM units、16 个 memory chips，每个 memory chip 有 2 个 GDDR6-PIM channels。
-- CXL switch 到 host 用 x16 lanes，每个 CXL device 通过 x4 lanes 接 switch。
-- Inter-device communication 通过 Shared Buffer 和 CXL port 完成，作者定义了：
-  - SEND_CXL / RECV_CXL: device-to-device send/receive；
-  - BCAST_CXL: broadcast，一个 device 写多个 device；
-  - gather: 接收方执行多个 RECV_CXL，发送方各执行 SEND_CXL。
-- 标准 CXL.mem 不直接支持 broadcast，作者用 reserved H-slot code 扩展，让 switch 把一个 flit 转发到多个目标 device。
+- inter-device communication: 作者定义了：
+  - `SEND_CXL` / `RECV_CXL`: device-to-device send/receive, 组成了 a CXL write transaction；
+  - `BCAST_CXL`: broadcast，一个 device 写多个 device；
+    - 标准 CXL.mem 不直接支持 broadcast，
+    - 作者在 PortBasedRouting flit 的 header 里使用 reserved H-slot code 来标记 broadcast, switch 看到这个特殊 code 后把这个 flit 当成 broadcast; 根据 device ID mask 转发给多个目标 devices; 每个目标 device 完成写入后返回 ACK。
+  - gather: 接收方执行多个 `RECV_CXL`，发送方各执行一条 `SEND_CXL`
+- CXL port:
 
 ### 4.2.Hierarchical PIM-PNM Architecture
 - GDDR6-PIM channel:
@@ -557,6 +551,42 @@ A CXL-Enabled GPU-Free System for Large Language Model Inference
 - CENT 用 CXL memory expansion 解决容量，用 PIM 解决 decoding bandwidth，用 PNM/RISC-V 解决复杂操作灵活性。
 - 相比 GPU baseline，在最大支持 batch size 下，CENT achieves 2.3× higher throughput, 2.3×/2.9× less energy（正文不同位置表述略有差异）, and 5.2× more tokens per dollar。
 - 更大的模型、更长的 context、更受 memory capacity 限制的 batch size，会进一步放大 CENT 这类 GPU-free PIM+CXL 架构的优势。
+
+
+## (github) CENT
+- `README.md`
+- `CENT.png` README 中展示的 CENT 系统/评估流程示意图。
+- `requirements.txt` Python 依赖列表，主要包括 `pandas`、`matplotlib`、`torch`、`scipy` 等仿真和画图所需库。
+- `LICENSE`
+- `aim_simulator/`
+  - AiM/PIM 底层内存系统模拟器，基于 Ramulator2，用来执行 CENT 生成的 memory trace，并输出 memory cycles、command count 等统计信息。
+- `cent_simulation/` CENT 的核心仿真代码。
+  - `function_sim.py`：仿真入口之一，根据 Llama/GPT 参数生成 Transformer block 的 PIM operation trace。
+  - `Llama.py`、`GPT.py`：描述 Llama/GPT 的 attention、FFN、embedding 等计算如何映射到 PIM。
+  - `TransformerBlock.py`：通用 Transformer block/PIM 映射逻辑，包括矩阵向量乘、attention score、attention output、FFN 等 trace 生成函数。
+  - `aim_sim.py`：抽象 PIM device/DIMM/channel/bank 层级，并定义 PIM 操作，如 MAC、EWMUL、COPY、DRAM read/write。
+  - `run_sim.py`：端到端仿真调度脚本，负责生成 trace、调用 AiM simulator、处理结果并写入 CSV。
+  - `cxl_latency.py`：估算 CXL/PCIe broadcast、gather 等跨设备通信延迟。
+  - `cent_power_calculator.py`：根据模拟器统计结果估算功耗和能耗。
+  - `simulation.sh`：批量运行 Llama2-7B/13B/70B、pipeline/model parallel、long-context 等实验。
+  - `process_results.sh`：汇总仿真结果，生成后续画图需要的 processed CSV。
+- `trace/` 存放或生成 memory trace 的目录。
+  - `compile.py`、`compile.sh` 用来从 simulator log 中提取 `memory_system_cycles` 等关键统计。
+- `cost_model/` CENT CXL/PIM 控制器成本模型。
+  - 用 die area、yield、wafer cost、packaging、NRE 等参数估算设备成本，并支持 Figure 12 的成本分析。
+- `data/` GPU baseline 数据，包括 GPU latency、throughput、energy、power 等，用来和 CENT 仿真结果做对比。
+- `figure_scripts/` 论文图表生成脚本。
+  - 对应 Figure 12-15，包括成本、CENT/GPU latency speedup、throughput speedup、TCO normalized throughput、long-context latency、QoS、功耗和能效等图。
+- `figure_source_data/`
+  - 画图脚本导出的源数据 CSV，方便复现论文图表或复制到 Excel 中重新绘图。
+- `figures/`
+  - 运行 `generate_figures.sh` 后生成的 PDF 图表输出目录。
+- `generate_figures.sh`
+  - 一键运行 `figure_scripts/` 中的画图脚本，生成 Figure 12-15 的数据和图。
+- `remove_old_results.sh`
+  - 清理旧仿真结果和旧图表输出，便于重新跑 artifact。
+
+
 
 # PIMphony: Overcoming Bandwidth and Capacity Inefficiency in PIM-based Long-Context LLM Inference System
 
